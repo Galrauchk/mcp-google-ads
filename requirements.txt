@@ -1,5 +1,5 @@
 # MCP requirements
-mcp>=0.0.11
+mcp>=1.3.0,<2
 
 # Google API requirements
 google-auth>=2.25.2

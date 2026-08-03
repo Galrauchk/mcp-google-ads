@@ -1,20 +1,20 @@
-from typing import Any, Dict, List, Optional, Union
-from pydantic import Field
-import os
 import json
-import requests
-from datetime import datetime, timedelta
-from pathlib import Path
-
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.oauth2.credentials import Credentials
-from google.oauth2 import service_account
-from google.auth.transport.requests import Request
-from google.auth.exceptions import RefreshError
 import logging
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import requests
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
+from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 # MCP
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -32,7 +32,8 @@ mcp = FastMCP(
 
 # Constants and configuration
 SCOPES = ['https://www.googleapis.com/auth/adwords']
-API_VERSION = "v19"  # Google Ads API version
+API_VERSION = "v25"
+GOOGLE_ADS_API_ROOT = f"https://googleads.googleapis.com/{API_VERSION}"
 
 # Load environment variables
 try:
@@ -43,11 +44,116 @@ try:
 except ImportError:
     logger.warning("python-dotenv not installed, skipping .env file loading")
 
-# Get credentials from environment variables
+# Configuration. GOOGLE_ADS_CREDENTIALS_PATH reste accepte pour une migration douce, mais les
+# nouvelles variables separent toujours la configuration OAuth, le token utilisateur et la cle
+# de compte de service.
 GOOGLE_ADS_CREDENTIALS_PATH = os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH")
+GOOGLE_ADS_OAUTH_CLIENT_PATH = os.environ.get("GOOGLE_ADS_OAUTH_CLIENT_PATH")
+GOOGLE_ADS_OAUTH_TOKEN_PATH = os.environ.get("GOOGLE_ADS_OAUTH_TOKEN_PATH")
+GOOGLE_ADS_SERVICE_ACCOUNT_PATH = os.environ.get("GOOGLE_ADS_SERVICE_ACCOUNT_PATH")
 GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
 GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
 GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # oauth or service_account
+GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH = os.environ.get("GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH") == "1"
+
+
+class AuthenticationError(RuntimeError):
+    """Authentication failure whose message is safe to expose or log."""
+
+
+def google_ads_api_url(path: str) -> str:
+    return f"{GOOGLE_ADS_API_ROOT}/{path.lstrip('/')}"
+
+
+def public_error_message(error: Exception) -> str:
+    """Return an error description that cannot echo credentials or HTTP headers."""
+    if isinstance(error, AuthenticationError):
+        return str(error)
+    return type(error).__name__
+
+
+def google_ads_http_error(context: str, response: requests.Response) -> str:
+    """Expose only status metadata, never the provider response body."""
+    request_id = response.headers.get("request-id") if response.headers else None
+    if request_id and (
+        not isinstance(request_id, str)
+        or not all(char.isalnum() or char in "_-" for char in request_id)
+    ):
+        request_id = None
+    suffix = f" (request ID: {request_id})" if request_id else ""
+    return f"{context}: Google Ads API returned HTTP {response.status_code}{suffix}"
+
+
+def _is_oauth_client_config(data: dict[str, Any]) -> bool:
+    return isinstance(data, dict) and ("installed" in data or "web" in data)
+
+
+def _load_json_file(path: Path, label: str) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError as error:
+        raise AuthenticationError(f"{label} file not found") from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise AuthenticationError(f"{label} file is unreadable or invalid") from error
+    if not isinstance(data, dict):
+        raise AuthenticationError(f"{label} file must contain a JSON object")
+    return data
+
+
+def _default_oauth_token_path(client_path: Path | None = None) -> Path:
+    if client_path:
+        candidate = client_path.with_name("google_ads_token.json")
+        if candidate.resolve() == client_path.resolve():
+            candidate = client_path.with_name("google_ads_authorized_user.json")
+        return candidate
+    return Path.home() / ".config" / "mcp-google-ads" / "google_ads_token.json"
+
+
+def resolve_oauth_paths() -> tuple[Path | None, Path, dict[str, Any] | None]:
+    """Resolve separate OAuth client and token paths without ever reusing a client file."""
+    client_path = Path(GOOGLE_ADS_OAUTH_CLIENT_PATH).expanduser() if GOOGLE_ADS_OAUTH_CLIENT_PATH else None
+    token_path = Path(GOOGLE_ADS_OAUTH_TOKEN_PATH).expanduser() if GOOGLE_ADS_OAUTH_TOKEN_PATH else None
+    legacy_data = None
+
+    if GOOGLE_ADS_CREDENTIALS_PATH and not client_path and not token_path:
+        legacy_path = Path(GOOGLE_ADS_CREDENTIALS_PATH).expanduser()
+        if not legacy_path.exists():
+            raise AuthenticationError(
+                "Legacy GOOGLE_ADS_CREDENTIALS_PATH does not exist; use explicit OAuth path variables"
+            )
+        legacy_data = _load_json_file(legacy_path, "Legacy OAuth credential")
+        if _is_oauth_client_config(legacy_data):
+            client_path = legacy_path
+        else:
+            token_path = legacy_path
+
+    if not token_path:
+        token_path = _default_oauth_token_path(client_path)
+
+    if client_path and client_path.resolve() == token_path.resolve():
+        raise AuthenticationError("OAuth client configuration and token paths must be different")
+
+    return client_path, token_path, legacy_data
+
+
+def _write_oauth_token(path: Path, serialized_credentials: str) -> None:
+    """Atomically write an OAuth token with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".oauth-token-", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
+            os.chmod(temporary_path, 0o600)
+            handle.write(serialized_credentials)
+        os.replace(temporary_path, path)
+        os.chmod(path, 0o600)
+    except OSError as error:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink()
+        raise AuthenticationError("OAuth token could not be saved") from error
 
 def format_customer_id(customer_id: str) -> str:
     """Format customer ID to ensure it's 10 digits without dashes."""
@@ -74,105 +180,97 @@ def get_credentials():
     Returns:
         Valid credentials object to use with Google Ads API
     """
-    if not GOOGLE_ADS_CREDENTIALS_PATH:
-        raise ValueError("GOOGLE_ADS_CREDENTIALS_PATH environment variable not set")
-    
     auth_type = GOOGLE_ADS_AUTH_TYPE.lower()
-    logger.info(f"Using authentication type: {auth_type}")
+    if auth_type not in {"oauth", "service_account"}:
+        raise AuthenticationError("GOOGLE_ADS_AUTH_TYPE must be oauth or service_account")
+    logger.info("Using authentication type: %s", auth_type)
     
     # Service Account authentication
     if auth_type == "service_account":
-        try:
-            return get_service_account_credentials()
-        except Exception as e:
-            logger.error(f"Error with service account authentication: {str(e)}")
-            raise
+        return get_service_account_credentials()
     
     # OAuth 2.0 authentication (default)
     return get_oauth_credentials()
 
 def get_service_account_credentials():
     """Get credentials using a service account key file."""
-    logger.info(f"Loading service account credentials from {GOOGLE_ADS_CREDENTIALS_PATH}")
-    
-    if not os.path.exists(GOOGLE_ADS_CREDENTIALS_PATH):
-        raise FileNotFoundError(f"Service account key file not found at {GOOGLE_ADS_CREDENTIALS_PATH}")
+    credentials_path = GOOGLE_ADS_SERVICE_ACCOUNT_PATH or GOOGLE_ADS_CREDENTIALS_PATH
+    if not credentials_path:
+        raise AuthenticationError("GOOGLE_ADS_SERVICE_ACCOUNT_PATH is required")
+    if not os.path.exists(credentials_path):
+        raise AuthenticationError("Service account credential file not found")
     
     try:
         credentials = service_account.Credentials.from_service_account_file(
-            GOOGLE_ADS_CREDENTIALS_PATH, 
+            credentials_path,
             scopes=SCOPES
         )
         
         # Check if impersonation is required
         impersonation_email = os.environ.get("GOOGLE_ADS_IMPERSONATION_EMAIL")
         if impersonation_email:
-            logger.info(f"Impersonating user: {impersonation_email}")
+            logger.info("Service account impersonation enabled")
             credentials = credentials.with_subject(impersonation_email)
             
         return credentials
         
-    except Exception as e:
-        logger.error(f"Error loading service account credentials: {str(e)}")
+    except AuthenticationError:
         raise
+    except Exception as error:
+        logger.error("Service account authentication failed (%s)", type(error).__name__)
+        raise AuthenticationError("Service account authentication failed") from error
 
 def get_oauth_credentials():
-    """Get and refresh OAuth user credentials."""
+    """Get and refresh OAuth credentials without overwriting the OAuth client config."""
     creds = None
     client_config = None
-    
-    # Path to store the refreshed token
-    token_path = GOOGLE_ADS_CREDENTIALS_PATH
-    if os.path.exists(token_path) and not os.path.basename(token_path).endswith('.json'):
-        # If it's not explicitly a .json file, append a default name
-        token_dir = os.path.dirname(token_path)
-        token_path = os.path.join(token_dir, 'google_ads_token.json')
-    
-    # Check if token file exists and load credentials
-    if os.path.exists(token_path):
+    client_path, token_path, legacy_data = resolve_oauth_paths()
+
+    if client_path:
+        client_config = legacy_data if legacy_data is not None else _load_json_file(
+            client_path, "OAuth client configuration"
+        )
+        if not _is_oauth_client_config(client_config):
+            raise AuthenticationError("OAuth client configuration has an unexpected format")
+
+    if token_path.exists():
         try:
-            logger.info(f"Loading OAuth credentials from {token_path}")
-            with open(token_path, 'r') as f:
-                creds_data = json.load(f)
-                # Check if this is a client config or saved credentials
-                if "installed" in creds_data or "web" in creds_data:
-                    client_config = creds_data
-                    logger.info("Found OAuth client configuration")
-                else:
-                    logger.info("Found existing OAuth token")
-                    creds = Credentials.from_authorized_user_info(creds_data, SCOPES)
-        except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON in token file: {token_path}")
-            creds = None
-        except Exception as e:
-            logger.warning(f"Error loading credentials: {str(e)}")
-            creds = None
-    
-    # If credentials don't exist or are invalid, get new ones
+            token_data = legacy_data if legacy_data is not None and not client_path else _load_json_file(
+                token_path, "OAuth token"
+            )
+            if _is_oauth_client_config(token_data):
+                raise AuthenticationError("OAuth client configuration cannot be used as the token file")
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            logger.info("Existing OAuth token loaded")
+        except AuthenticationError:
+            raise
+        except Exception as error:
+            logger.error("OAuth token could not be loaded (%s)", type(error).__name__)
+            raise AuthenticationError("OAuth token could not be loaded") from error
+
+    credentials_changed = False
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
                 logger.info("Refreshing expired token")
                 creds.refresh(Request())
                 logger.info("Token successfully refreshed")
-            except RefreshError as e:
-                logger.warning(f"Error refreshing token: {str(e)}, will try to get new token")
+                credentials_changed = True
+            except RefreshError as error:
+                logger.warning("OAuth token refresh failed (%s)", type(error).__name__)
                 creds = None
-            except Exception as e:
-                logger.error(f"Unexpected error refreshing token: {str(e)}")
-                raise
-        
-        # If we need new credentials
+            except Exception as error:
+                logger.error("Unexpected OAuth refresh failure (%s)", type(error).__name__)
+                raise AuthenticationError("OAuth token refresh failed") from error
+
         if not creds:
-            # If no client_config is defined yet, create one from environment variables
             if not client_config:
-                logger.info("Creating OAuth client config from environment variables")
                 client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
                 client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
-                
                 if not client_id or not client_secret:
-                    raise ValueError("GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET must be set if no client config file exists")
-                
+                    raise AuthenticationError(
+                        "OAuth client configuration is required to create a new user token"
+                    )
                 client_config = {
                     "installed": {
                         "client_id": client_id,
@@ -182,35 +280,36 @@ def get_oauth_credentials():
                         "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
                     }
                 }
-            
-            # Run the OAuth flow
+            if not GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH:
+                raise AuthenticationError(
+                    "Interactive OAuth is disabled; set GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH=1 for explicit setup"
+                )
             logger.info("Starting OAuth authentication flow")
             flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
             creds = flow.run_local_server(port=0)
             logger.info("OAuth flow completed successfully")
-        
-        # Save the refreshed/new credentials
-        try:
-            logger.info(f"Saving credentials to {token_path}")
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(token_path), exist_ok=True)
-            with open(token_path, 'w') as f:
-                f.write(creds.to_json())
-        except Exception as e:
-            logger.warning(f"Could not save credentials: {str(e)}")
-    
+            credentials_changed = True
+
+    if credentials_changed:
+        _write_oauth_token(token_path, creds.to_json())
+        logger.info("OAuth token saved to its dedicated token file")
+
     return creds
 
 def get_headers(creds):
     """Get headers for Google Ads API requests."""
     if not GOOGLE_ADS_DEVELOPER_TOKEN:
-        raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set")
+        raise AuthenticationError("GOOGLE_ADS_DEVELOPER_TOKEN is required")
     
     # Handle different credential types
     if isinstance(creds, service_account.Credentials):
         # For service account, we need to get a new bearer token
         auth_req = Request()
-        creds.refresh(auth_req)
+        try:
+            creds.refresh(auth_req)
+        except Exception as error:
+            logger.error("Service account token refresh failed (%s)", type(error).__name__)
+            raise AuthenticationError("Service account token refresh failed") from error
         token = creds.token
     else:
         # For OAuth credentials, check if token needs refresh
@@ -220,16 +319,19 @@ def get_headers(creds):
                     logger.info("Refreshing expired OAuth token in get_headers")
                     creds.refresh(Request())
                     logger.info("Token successfully refreshed in get_headers")
-                except RefreshError as e:
-                    logger.error(f"Error refreshing token in get_headers: {str(e)}")
-                    raise ValueError(f"Failed to refresh OAuth token: {str(e)}")
-                except Exception as e:
-                    logger.error(f"Unexpected error refreshing token in get_headers: {str(e)}")
-                    raise
+                except RefreshError as error:
+                    logger.error("OAuth refresh failed while building headers (%s)", type(error).__name__)
+                    raise AuthenticationError("OAuth token refresh failed") from error
+                except Exception as error:
+                    logger.error("Unexpected OAuth refresh failure (%s)", type(error).__name__)
+                    raise AuthenticationError("OAuth token refresh failed") from error
             else:
-                raise ValueError("OAuth credentials are invalid and cannot be refreshed")
+                raise AuthenticationError("OAuth credentials are invalid and cannot be refreshed")
         
         token = creds.token
+
+    if not token:
+        raise AuthenticationError("OAuth access token is unavailable")
         
     headers = {
         'Authorization': f'Bearer {token}',
@@ -257,11 +359,11 @@ async def list_accounts() -> str:
         creds = get_credentials()
         headers = get_headers(creds)
         
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
+        url = google_ads_api_url("customers:listAccessibleCustomers")
         response = requests.get(url, headers=headers)
         
         if response.status_code != 200:
-            return f"Error accessing accounts: {response.text}"
+            return google_ads_http_error("Error accessing accounts", response)
         
         customers = response.json()
         if not customers.get('resourceNames'):
@@ -278,8 +380,8 @@ async def list_accounts() -> str:
         
         return "\n".join(result_lines)
     
-    except Exception as e:
-        return f"Error listing accounts: {str(e)}"
+    except Exception as error:
+        return f"Error listing accounts: {public_error_message(error)}"
 
 @mcp.tool()
 async def execute_gaql_query(
@@ -307,13 +409,13 @@ async def execute_gaql_query(
         headers = get_headers(creds)
         
         formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = google_ads_api_url(f"customers/{formatted_customer_id}/googleAds:search")
         
         payload = {"query": query}
         response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
-            return f"Error executing query: {response.text}"
+            return google_ads_http_error("Error executing query", response)
         
         results = response.json()
         if not results.get('results'):
@@ -351,8 +453,8 @@ async def execute_gaql_query(
         
         return "\n".join(result_lines)
     
-    except Exception as e:
-        return f"Error executing GAQL query: {str(e)}"
+    except Exception as error:
+        return f"Error executing GAQL query: {public_error_message(error)}"
 
 @mcp.tool()
 async def get_campaign_performance(
@@ -512,13 +614,13 @@ async def run_gaql(
         headers = get_headers(creds)
         
         formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = google_ads_api_url(f"customers/{formatted_customer_id}/googleAds:search")
         
         payload = {"query": query}
         response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
-            return f"Error executing query: {response.text}"
+            return google_ads_http_error("Error executing query", response)
         
         results = response.json()
         if not results.get('results'):
@@ -601,8 +703,8 @@ async def run_gaql(
             
             return "\n".join(result_lines)
     
-    except Exception as e:
-        return f"Error executing GAQL query: {str(e)}"
+    except Exception as error:
+        return f"Error executing GAQL query: {public_error_message(error)}"
 
 @mcp.tool()
 async def get_ad_creatives(
@@ -649,13 +751,13 @@ async def get_ad_creatives(
         headers = get_headers(creds)
         
         formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = google_ads_api_url(f"customers/{formatted_customer_id}/googleAds:search")
         
         payload = {"query": query}
         response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
-            return f"Error retrieving ad creatives: {response.text}"
+            return google_ads_http_error("Error retrieving ad creatives", response)
         
         results = response.json()
         if not results.get('results'):
@@ -699,8 +801,8 @@ async def get_ad_creatives(
         
         return "\n".join(output_lines)
     
-    except Exception as e:
-        return f"Error retrieving ad creatives: {str(e)}"
+    except Exception as error:
+        return f"Error retrieving ad creatives: {public_error_message(error)}"
 
 @mcp.tool()
 async def get_account_currency(
@@ -744,13 +846,13 @@ async def get_account_currency(
         headers = get_headers(creds)
         
         formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = google_ads_api_url(f"customers/{formatted_customer_id}/googleAds:search")
         
         payload = {"query": query}
         response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
-            return f"Error retrieving account currency: {response.text}"
+            return google_ads_http_error("Error retrieving account currency", response)
         
         results = response.json()
         if not results.get('results'):
@@ -762,9 +864,9 @@ async def get_account_currency(
         
         return f"Account {formatted_customer_id} uses currency: {currency_code}"
     
-    except Exception as e:
-        logger.error(f"Error retrieving account currency: {str(e)}")
-        return f"Error retrieving account currency: {str(e)}"
+    except Exception as error:
+        logger.error("Error retrieving account currency (%s)", type(error).__name__)
+        return f"Error retrieving account currency: {public_error_message(error)}"
 
 @mcp.resource("gaql://reference")
 def gaql_reference() -> str:
@@ -965,13 +1067,13 @@ async def get_image_assets(
         headers = get_headers(creds)
         
         formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = google_ads_api_url(f"customers/{formatted_customer_id}/googleAds:search")
         
         payload = {"query": query}
         response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
-            return f"Error retrieving image assets: {response.text}"
+            return google_ads_http_error("Error retrieving image assets", response)
         
         results = response.json()
         if not results.get('results'):
@@ -1003,8 +1105,8 @@ async def get_image_assets(
         
         return "\n".join(output_lines)
     
-    except Exception as e:
-        return f"Error retrieving image assets: {str(e)}"
+    except Exception as error:
+        return f"Error retrieving image assets: {public_error_message(error)}"
 
 @mcp.tool()
 async def download_image_asset(
@@ -1054,13 +1156,13 @@ async def download_image_asset(
         headers = get_headers(creds)
         
         formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = google_ads_api_url(f"customers/{formatted_customer_id}/googleAds:search")
         
         payload = {"query": query}
         response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
-            return f"Error retrieving image asset: {response.text}"
+            return google_ads_http_error("Error retrieving image asset", response)
         
         results = response.json()
         if not results.get('results'):
@@ -1088,13 +1190,13 @@ async def download_image_asset(
             except ValueError:
                 # If the path is not relative to base_dir, use the default safe directory
                 resolved_output_dir = base_dir / "ad_images"
-                logger.warning(f"Invalid output directory '{output_dir}' - using default './ad_images'")
+                logger.warning("Invalid output directory; using the default local directory")
             
             # Create output directory if it doesn't exist
             resolved_output_dir.mkdir(parents=True, exist_ok=True)
             
-        except Exception as e:
-            return f"Error creating output directory: {str(e)}"
+        except Exception as error:
+            return f"Error creating output directory: {public_error_message(error)}"
         
         # Download the image
         image_response = requests.get(image_url)
@@ -1112,8 +1214,8 @@ async def download_image_asset(
         
         return f"Successfully downloaded image asset {asset_id} to {file_path}"
     
-    except Exception as e:
-        return f"Error downloading image asset: {str(e)}"
+    except Exception as error:
+        return f"Error downloading image asset: {public_error_message(error)}"
 
 @mcp.tool()
 async def get_asset_usage(
@@ -1179,21 +1281,6 @@ async def get_asset_usage(
         LIMIT 500
     """
 
-    # Also try ad_group_asset for ad group level information
-    ad_group_query = f"""
-        SELECT
-            ad_group.id,
-            ad_group.name,
-            asset.id,
-            asset.name,
-            asset.type
-        FROM
-            ad_group_asset
-        WHERE
-            {where_clause}
-        LIMIT 500
-    """
-    
     try:
         creds = get_credentials()
         headers = get_headers(creds)
@@ -1201,12 +1288,12 @@ async def get_asset_usage(
         formatted_customer_id = format_customer_id(customer_id)
         
         # First get the assets
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = google_ads_api_url(f"customers/{formatted_customer_id}/googleAds:search")
         payload = {"query": assets_query}
         assets_response = requests.post(url, headers=headers, json=payload)
         
         if assets_response.status_code != 200:
-            return f"Error retrieving assets: {assets_response.text}"
+            return google_ads_http_error("Error retrieving assets", assets_response)
         
         assets_results = assets_response.json()
         if not assets_results.get('results'):
@@ -1217,7 +1304,7 @@ async def get_asset_usage(
         assoc_response = requests.post(url, headers=headers, json=payload)
         
         if assoc_response.status_code != 200:
-            return f"Error retrieving asset associations: {assoc_response.text}"
+            return google_ads_http_error("Error retrieving asset associations", assoc_response)
         
         assoc_results = assoc_response.json()
         
@@ -1248,8 +1335,6 @@ async def get_asset_usage(
                 campaign = result.get('campaign', {})
                 ad_group = result.get('adGroup', {})
                 ad = result.get('adGroupAd', {}).get('ad', {}) if 'adGroupAd' in result else {}
-                asset_link = result.get('assetLink', {})
-                
                 usage_info = {
                     'campaign_id': campaign.get('id', 'N/A'),
                     'campaign_name': campaign.get('name', 'N/A'),
@@ -1283,8 +1368,8 @@ async def get_asset_usage(
         
         return "\n".join(output_lines)
     
-    except Exception as e:
-        return f"Error retrieving asset usage: {str(e)}"
+    except Exception as error:
+        return f"Error retrieving asset usage: {public_error_message(error)}"
 
 @mcp.tool()
 async def analyze_image_assets(
@@ -1341,7 +1426,7 @@ async def analyze_image_assets(
             campaign_asset
         WHERE
             asset.type = 'IMAGE'
-            AND segments.date DURING LAST_30_DAYS
+            AND segments.date DURING {date_range}
         ORDER BY
             metrics.impressions DESC
         LIMIT 200
@@ -1352,13 +1437,13 @@ async def analyze_image_assets(
         headers = get_headers(creds)
         
         formatted_customer_id = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = google_ads_api_url(f"customers/{formatted_customer_id}/googleAds:search")
         
         payload = {"query": query}
         response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
-            return f"Error analyzing image assets: {response.text}"
+            return google_ads_http_error("Error analyzing image assets", response)
         
         results = response.json()
         if not results.get('results'):
@@ -1415,7 +1500,7 @@ async def analyze_image_assets(
             ctr = (data['clicks'] / data['impressions'] * 100) if data['impressions'] > 0 else 0
             
             # Format metrics
-            output_lines.append(f"\nPerformance Metrics:")
+            output_lines.append("\nPerformance Metrics:")
             output_lines.append(f"  Impressions: {data['impressions']:,}")
             output_lines.append(f"  Clicks: {data['clicks']:,}")
             output_lines.append(f"  CTR: {ctr:.2f}%")
@@ -1437,8 +1522,8 @@ async def analyze_image_assets(
         
         return "\n".join(output_lines)
     
-    except Exception as e:
-        return f"Error analyzing image assets: {str(e)}"
+    except Exception as error:
+        return f"Error analyzing image assets: {public_error_message(error)}"
 
 @mcp.tool()
 async def list_resources(

@@ -4,7 +4,7 @@
 
 ![Google Ads MCP](bg.jpeg)
 
-A tool that connects [Google Ads](https://ads.google.com/) with Claude AI, allowing you to analyze your advertising data through natural language conversations. This integration gives you access to campaign information, performance metrics, keyword analytics, and ad management—all through simple chat with Claude.
+A tool that connects [Google Ads](https://ads.google.com/) with Claude AI, allowing you to analyze your advertising data through natural language conversations. This integration gives you access to campaign information, performance metrics, keyword analytics, and ad management - all through simple chat with Claude.
 
 ---
 
@@ -162,7 +162,7 @@ Best for individual users or desktop applications:
 3. Enable the Google Ads API
 4. Go to "Credentials" → "Create Credentials" → "OAuth Client ID"
 5. Choose "Desktop Application" as the application type
-6. Download the OAuth client configuration file (client_secret.json)
+6. Download the OAuth client configuration file and store it outside the repository
 7. Create a Google Ads API Developer token (see below)
 
 #### Option B: Service Account (Server-to-Server Authentication)
@@ -181,7 +181,7 @@ Better for automated systems or managing multiple accounts:
 
 The application now includes robust token refresh handling:
 
-- **OAuth 2.0 Tokens**: The tool will automatically refresh expired OAuth tokens when possible, or prompt for re-authentication if the refresh token is invalid.
+- **OAuth 2.0 Tokens**: The tool refreshes expired OAuth tokens when possible. If no usable token remains, normal MCP execution fails safely instead of opening a browser. Initial or renewed authorization requires the explicit supervised procedure in `docs/security-migration.md`.
 - **Service Account Tokens**: Service account tokens are automatically generated and refreshed as needed without user intervention.
 
 #### Authentication Method Comparison
@@ -360,8 +360,10 @@ The Google Ads MCP now supports environment file configuration for easier setup.
    # Authentication Type: "oauth" or "service_account"
    GOOGLE_ADS_AUTH_TYPE=oauth
    
-   # Path to your credentials file (OAuth client secret or service account key)
-   GOOGLE_ADS_CREDENTIALS_PATH=/path/to/your/credentials.json
+   # OAuth files must be distinct and stored outside the repository
+   GOOGLE_ADS_OAUTH_CLIENT_PATH=/absolute/path/outside/repository/oauth-client.json
+   GOOGLE_ADS_OAUTH_TOKEN_PATH=/absolute/path/outside/repository/google-ads-token.json
+   GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH=0
    
    # Your Google Ads Developer Token
    GOOGLE_ADS_DEVELOPER_TOKEN=your_developer_token_here
@@ -388,7 +390,9 @@ You can also set environment variables directly in your system or in the configu
       "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
       "env": {
         "GOOGLE_ADS_AUTH_TYPE": "oauth",
-        "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/credentials.json",
+        "GOOGLE_ADS_OAUTH_CLIENT_PATH": "/PATH/OUTSIDE/REPOSITORY/oauth-client.json",
+        "GOOGLE_ADS_OAUTH_TOKEN_PATH": "/PATH/OUTSIDE/REPOSITORY/google-ads-token.json",
+        "GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH": "0",
         "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
         "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
       }
@@ -407,7 +411,9 @@ You can also set environment variables directly in your system or in the configu
       "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
       "env": {
         "GOOGLE_ADS_AUTH_TYPE": "oauth",
-        "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/credentials.json",
+        "GOOGLE_ADS_OAUTH_CLIENT_PATH": "/PATH/OUTSIDE/REPOSITORY/oauth-client.json",
+        "GOOGLE_ADS_OAUTH_TOKEN_PATH": "/PATH/OUTSIDE/REPOSITORY/google-ads-token.json",
+        "GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH": "0",
         "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
         "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
       }
@@ -419,7 +425,7 @@ You can also set environment variables directly in your system or in the configu
 ### 6. Connect Claude to Google Ads
 
 1. Download and install [Claude Desktop](https://claude.ai/download) if you haven't already
-2. Make sure you have your Google service account credentials file saved somewhere on your computer
+2. Make sure your Google service account credentials file is stored outside the repository
 3. Open your computer's Terminal (Mac) or Command Prompt (Windows) and type:
 
 ```bash
@@ -439,7 +445,8 @@ Add the following text (this tells Claude how to connect to Google Ads):
       "command": "/FULL/PATH/TO/mcp-google-ads-main/.venv/bin/python",
       "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
       "env": {
-        "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
+        "GOOGLE_ADS_AUTH_TYPE": "service_account",
+        "GOOGLE_ADS_SERVICE_ACCOUNT_PATH": "/PATH/OUTSIDE/REPOSITORY/service-account.json",
         "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
         "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
       }
@@ -498,7 +505,8 @@ Cursor is an AI-powered code editor that can be enhanced with MCP tools. You can
          "command": "/FULL/PATH/TO/mcp-google-ads-main/.venv/bin/python",
          "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
          "env": {
-           "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
+           "GOOGLE_ADS_AUTH_TYPE": "service_account",
+           "GOOGLE_ADS_SERVICE_ACCOUNT_PATH": "/PATH/OUTSIDE/REPOSITORY/service-account.json",
            "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
            "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
          }
@@ -636,7 +644,8 @@ Remember that most issues have been encountered by others before, and there's us
 
 ### Testing Your Setup
 
-The repository includes test files that let you verify your Google Ads API connection is working correctly before using it with Claude or Cursor.
+The repository includes hermetic tests for formatting, authentication safety and HTTP handling.
+They never contact Google and never start OAuth.
 
 #### Testing Basic Functionality
 
@@ -650,43 +659,13 @@ The repository includes test files that let you verify your Google Ads API conne
    .venv\Scripts\activate
    ```
 
-2. Configure the environment variables in the test file or set them in your environment:
-   - Open `test_google_ads_mcp.py` in a text editor
-   - Find the section starting with `if not os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH"):`
-   - Update the placeholder values with your actual credentials or comment out this section if you've set them as environment variables
-
-3. Run the test:
+2. Run the tests without credentials:
    ```bash
-   python test_google_ads_mcp.py
+   python -m unittest discover -v
    ```
 
-4. The test will:
-   - List all your Google Ads accounts
-   - Use the first account ID to test campaign performance retrieval
-   - Test ad performance data
-   - Retrieve ad creatives
-   - Run a sample GAQL query
-
-#### Testing Authentication and Token Refresh
-
-To specifically test the authentication and token refresh mechanisms:
-
-1. Make sure your virtual environment is activated and your `.env` file is configured.
-
-2. Run the token refresh test:
-   ```bash
-   python test_token_refresh.py
-   ```
-
-3. This test will:
-   - Verify that credentials can be loaded from your configured auth type (OAuth or service account)
-   - Display information about the current token status and expiry
-   - Test the customer ID formatting function
-   - For OAuth tokens, attempt to refresh the token and verify it worked
-
-The token refresh test can help confirm that both OAuth and service account credentials are properly configured before using the server with Claude or Cursor.
-   
-If all tests complete successfully, your setup is working correctly and ready to use with Claude or Cursor.
+The tests mock credentials and HTTP calls. See `docs/security-migration.md` for the configuration
+migration and the supervised one-time OAuth procedure.
 
 ---
 

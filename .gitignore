@@ -20,6 +20,23 @@ env/
 service_account_credentials.json
 credentials.json
 token.json
+*.bak
+*.backup
+credentials*.json*
+client_secret*.json*
+*credentials*.json*
+*token*.json*
+oauth*.json*
+authorized_user*.json*
+service-account*.json*
+service_account*.json*
+*.pem
+*.p12
+*.key
+.secrets/
+# Local one-off OAuth helper from the migration worktree. It may contain machine-specific paths
+# or copied credentials and must never become a repository artifact.
+reauth.py
 
 # Editor-specific files
 .vscode/
