@@ -156,6 +156,98 @@ class AuthenticationSecurityTests(unittest.TestCase):
         secret = "developer-token=developer-value bearer access-value"
         self.assertEqual(server.public_error_message(ValueError(secret)), "ValueError")
 
+    def _write_token(self, path, mode=0o600):
+        path.write_text(json.dumps({"token": "access-value", "refresh_token": "refresh-value"}), encoding="utf-8")
+        path.chmod(mode)
+
+    def test_an_existing_world_readable_token_is_narrowed_before_it_is_read(self):
+        # The 0600 chmod only ran when THIS process wrote the token. A token left behind by an
+        # older version, a backup or a manual copy stayed readable by everyone for its whole life.
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "oauth-token.json"
+            self._write_token(token_path, mode=0o644)
+
+            with (
+                patch.object(server, "GOOGLE_ADS_OAUTH_CLIENT_PATH", None),
+                patch.object(server, "GOOGLE_ADS_OAUTH_TOKEN_PATH", str(token_path)),
+                patch.object(server, "GOOGLE_ADS_CREDENTIALS_PATH", None),
+                patch.object(server.Credentials, "from_authorized_user_info", return_value=FakeCredentials()),
+            ):
+                server.get_oauth_credentials()
+
+            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+
+    def test_an_unsecurable_token_is_refused_rather_than_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "oauth-token.json"
+            self._write_token(token_path, mode=0o644)
+
+            with (
+                patch.object(server, "GOOGLE_ADS_OAUTH_CLIENT_PATH", None),
+                patch.object(server, "GOOGLE_ADS_OAUTH_TOKEN_PATH", str(token_path)),
+                patch.object(server, "GOOGLE_ADS_CREDENTIALS_PATH", None),
+                patch.object(server.os, "chmod", side_effect=OSError("read-only filesystem")),
+            ):
+                with self.assertRaisesRegex(server.AuthenticationError, "could not be secured"):
+                    server.get_oauth_credentials()
+
+    def test_a_corrupt_token_blocks_by_default_but_reauthorizes_when_explicitly_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client_path = Path(directory) / "oauth-client.json"
+            token_path = Path(directory) / "oauth-token.json"
+            client_path.write_text(
+                json.dumps({"installed": {"client_id": "placeholder", "client_secret": "placeholder"}}),
+                encoding="utf-8",
+            )
+            token_path.write_text("{ this is not json", encoding="utf-8")
+            token_path.chmod(0o600)
+
+            # Default: fail closed, exactly as before.
+            with (
+                patch.object(server, "GOOGLE_ADS_OAUTH_CLIENT_PATH", str(client_path)),
+                patch.object(server, "GOOGLE_ADS_OAUTH_TOKEN_PATH", str(token_path)),
+                patch.object(server, "GOOGLE_ADS_CREDENTIALS_PATH", None),
+                patch.object(server, "GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH", False),
+            ):
+                with self.assertRaises(server.AuthenticationError):
+                    server.get_oauth_credentials()
+
+            # Explicitly supervised: the documented reauthorization can actually run.
+            flow = FakeOAuthFlow(FakeCredentials())
+            with (
+                patch.object(server, "GOOGLE_ADS_OAUTH_CLIENT_PATH", str(client_path)),
+                patch.object(server, "GOOGLE_ADS_OAUTH_TOKEN_PATH", str(token_path)),
+                patch.object(server, "GOOGLE_ADS_CREDENTIALS_PATH", None),
+                patch.object(server, "GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH", True),
+                patch.object(server.InstalledAppFlow, "from_client_config", return_value=flow),
+            ):
+                credentials = server.get_oauth_credentials()
+
+            self.assertTrue(flow.called)
+            self.assertTrue(credentials.valid)
+
+    def test_a_token_path_pointing_at_the_client_file_is_never_reauthorized_over(self):
+        # This one must stay fatal even with the interactive flag on: recovering would send the
+        # flow into _write_oauth_token and overwrite the OAuth CLIENT file with a user token.
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "looks-like-a-token.json"
+            original = json.dumps({"installed": {"client_id": "placeholder", "client_secret": "placeholder"}})
+            token_path.write_text(original, encoding="utf-8")
+            token_path.chmod(0o600)
+
+            with (
+                patch.object(server, "GOOGLE_ADS_OAUTH_CLIENT_PATH", None),
+                patch.object(server, "GOOGLE_ADS_OAUTH_TOKEN_PATH", str(token_path)),
+                patch.object(server, "GOOGLE_ADS_CREDENTIALS_PATH", None),
+                patch.object(server, "GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH", True),
+                patch.object(server.InstalledAppFlow, "from_client_config") as flow_factory,
+            ):
+                with self.assertRaisesRegex(server.AuthenticationError, "cannot be used as the token file"):
+                    server.get_oauth_credentials()
+
+            flow_factory.assert_not_called()
+            self.assertEqual(token_path.read_text(encoding="utf-8"), original)
+
 
 if __name__ == "__main__":
     unittest.main()

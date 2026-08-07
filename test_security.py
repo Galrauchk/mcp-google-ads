@@ -45,7 +45,11 @@ class RepositorySecurityTests(unittest.TestCase):
             if name.endswith((".bak", ".backup"))
             or name == "reauth.py"
             or ("credentials" in name.lower() and name != ".env.example")
-            or ("token" in Path(name).name.lower() and not name.startswith("test_"))
+            # Both halves must judge the SAME string. Comparing "token" against the basename while
+            # exempting test files by the full repo-relative path made any nested test file a false
+            # positive: tests/auth/test_token.py does not start with "test_", so the guard would
+            # have called a legitimate test a committed secret and failed CI.
+            or ("token" in Path(name).name.lower() and not Path(name).name.startswith("test_"))
         ]
         self.assertEqual(forbidden, [])
 

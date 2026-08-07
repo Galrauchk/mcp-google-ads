@@ -32,7 +32,9 @@ dependencies = [
 "Bug Tracker" = "https://github.com/cohnen/mcp-google-ads/issues"
 
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# PEP 639 string-form `license = "MIT"` above is only understood from setuptools 77. Building with
+# the previously declared >=61.0 resolves to a version that cannot parse it and fails outright.
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

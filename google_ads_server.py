@@ -61,6 +61,10 @@ class AuthenticationError(RuntimeError):
     """Authentication failure whose message is safe to expose or log."""
 
 
+class _TokenPathConfusion(AuthenticationError):
+    """The token path points at the OAuth client file. Never recoverable by reauthorizing."""
+
+
 def google_ads_api_url(path: str) -> str:
     return f"{GOOGLE_ADS_API_ROOT}/{path.lstrip('/')}"
 
@@ -135,6 +139,30 @@ def resolve_oauth_paths() -> tuple[Path | None, Path, dict[str, Any] | None]:
         raise AuthenticationError("OAuth client configuration and token paths must be different")
 
     return client_path, token_path, legacy_data
+
+
+def _enforce_owner_only_token(path: Path) -> None:
+    """Narrow an existing token to owner-only BEFORE it is read.
+
+    `_write_oauth_token` only applies 0600 to tokens this process writes, so a token created by an
+    earlier version, restored from a backup or copied by hand could stay group- or world-readable
+    for its whole life and never be noticed. Reading it first and tightening it later would leave
+    the exposure open exactly as long as the file is useful.
+    """
+    try:
+        mode = path.stat().st_mode
+    except OSError as error:
+        raise AuthenticationError("OAuth token permissions could not be read") from error
+
+    if not mode & 0o077:
+        return
+
+    logger.warning("OAuth token was readable beyond its owner; narrowing it to 0600")
+    try:
+        os.chmod(path, 0o600)
+    except OSError as error:
+        # Fail closed. A token we cannot protect is a token we must not use.
+        raise AuthenticationError("OAuth token is readable by others and could not be secured") from error
 
 
 def _write_oauth_token(path: Path, serialized_credentials: str) -> None:
@@ -234,19 +262,35 @@ def get_oauth_credentials():
             raise AuthenticationError("OAuth client configuration has an unexpected format")
 
     if token_path.exists():
+        _enforce_owner_only_token(token_path)
         try:
             token_data = legacy_data if legacy_data is not None and not client_path else _load_json_file(
                 token_path, "OAuth token"
             )
             if _is_oauth_client_config(token_data):
-                raise AuthenticationError("OAuth client configuration cannot be used as the token file")
+                # NEVER recoverable, flag or no flag. Continuing would send the interactive flow
+                # into _write_oauth_token, which would overwrite the OAuth CLIENT file with a user
+                # token. The operator must fix the paths.
+                raise _TokenPathConfusion(
+                    "OAuth client configuration cannot be used as the token file"
+                )
             creds = Credentials.from_authorized_user_info(token_data, SCOPES)
             logger.info("Existing OAuth token loaded")
-        except AuthenticationError:
+        except _TokenPathConfusion:
             raise
         except Exception as error:
+            # A corrupt or truncated token used to be a dead end: it raised here, before the
+            # interactive branch below, so the documented supervised reauthorization could never
+            # run and the only way out was to delete the file by hand. When the operator has
+            # explicitly asked for that flow, an unreadable token is treated as no token at all.
+            # Without the flag the behaviour is unchanged: fail closed.
             logger.error("OAuth token could not be loaded (%s)", type(error).__name__)
-            raise AuthenticationError("OAuth token could not be loaded") from error
+            if not GOOGLE_ADS_ALLOW_INTERACTIVE_OAUTH:
+                if isinstance(error, AuthenticationError):
+                    raise
+                raise AuthenticationError("OAuth token could not be loaded") from error
+            logger.warning("Existing OAuth token is unusable; interactive setup is authorized, reauthorizing")
+            creds = None
 
     credentials_changed = False
     if not creds or not creds.valid:
