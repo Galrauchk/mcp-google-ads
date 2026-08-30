@@ -18,7 +18,15 @@ env/
 .env
 *.env
 service_account_credentials.json
-credentials.json
+# ⚠️ MOTIF, pas nom exact. Le 16/08/2026, `credentials.json` était bien ignoré mais
+# `credentials.json.bak` ne l'était PAS : un `git add .` l'aurait publié sur le fork
+# `Galrauchk/mcp-google-ads`, qui est PUBLIC. Le fichier porte un `client_secret` et un
+# `refresh_token` Google Ads. Rien n'a fuité (absent de l'historique, vérifié), mais une
+# liste blanche par nom exact laisse toujours passer la variante suivante.
+credentials.json*
+service_account_credentials.json*
+*.credentials.json
+token.json*
 token.json
 
 # Editor-specific files
