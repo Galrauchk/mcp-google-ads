@@ -32,7 +32,7 @@ mcp = FastMCP(
 
 # Constants and configuration
 SCOPES = ['https://www.googleapis.com/auth/adwords']
-API_VERSION = "v19"  # Google Ads API version
+API_VERSION = "v24"  # Google Ads API version
 
 # Load environment variables
 try:
@@ -765,6 +765,130 @@ async def get_account_currency(
     except Exception as e:
         logger.error(f"Error retrieving account currency: {str(e)}")
         return f"Error retrieving account currency: {str(e)}"
+
+# ---------------------------------------------------------------------------------------------
+# KEYWORD PLANNER (WebTrafic, 24/09/2026). Volumes de recherche reels Google, via le compte
+# client « WebTrafic - Agence Web » sous le MCC : le Keyword Planner refuse un compte manager
+# seul. Mesure du 24/09 : volumes exacts (590 pour « agence web montpellier »), pas des
+# fourchettes. Gratuit par appel, borne par le quota du jeton developpeur.
+# ---------------------------------------------------------------------------------------------
+KEYWORD_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_KEYWORD_CUSTOMER_ID", "4716263709")
+LANGUAGES = {"fr": "1002", "en": "1000", "es": "1003", "de": "1001", "it": "1004"}
+MAX_KEYWORDS = 100
+
+
+def _resolve_locations(headers, location: str) -> List[str]:
+    """`location` : 'France' par defaut, un ou plusieurs noms (virgules) ou ids numeriques."""
+    ids = []
+    for part in [p.strip() for p in (location or "France").split(",") if p.strip()]:
+        if part.isdigit():
+            ids.append(f"geoTargetConstants/{part}")
+            continue
+        if part.lower() == "france":
+            ids.append("geoTargetConstants/2250")
+            continue
+        url = f"https://googleads.googleapis.com/{API_VERSION}/geoTargetConstants:suggest"
+        r = requests.post(url, headers=headers, json={"locale": "fr", "countryCode": "FR", "locationNames": {"names": [part]}})
+        if r.status_code != 200:
+            raise ValueError(f"Lieu introuvable « {part} » : {r.text[:300]}")
+        sugg = r.json().get("geoTargetConstantSuggestions", [])
+        if not sugg:
+            raise ValueError(f"Lieu introuvable « {part} »")
+        ids.append(sugg[0]["geoTargetConstant"]["resourceName"])
+    return ids
+
+
+def _format_metrics_rows(rows, metrics_key: str) -> str:
+    lines = ["Mot-clé | Recherches/mois | Concurrence | Enchère haut de page (EUR) | 12 derniers mois (du plus ancien au plus récent)"]
+    for x in rows:
+        m = x.get(metrics_key) or {}
+        low = int(m.get("lowTopOfPageBidMicros", 0) or 0) / 1e6
+        high = int(m.get("highTopOfPageBidMicros", 0) or 0) / 1e6
+        bid = f"{low:.2f} à {high:.2f}" if high else "-"
+        months = [str(v.get("monthlySearches", 0)) for v in (m.get("monthlySearchVolumes") or [])[-12:]]
+        lines.append(f"{x.get('text')} | {m.get('avgMonthlySearches', 0)} | {m.get('competition', 'UNSPECIFIED')} | {bid} | {' '.join(months)}")
+    return "\n".join(lines)
+
+
+def _planner_common(headers, location: str, language: str) -> Dict[str, Any]:
+    lang = LANGUAGES.get((language or "fr").lower())
+    if not lang:
+        raise ValueError(f"Langue non geree « {language} » : {', '.join(LANGUAGES)}")
+    return {
+        "language": f"languageConstants/{lang}",
+        "geoTargetConstants": _resolve_locations(headers, location),
+        "keywordPlanNetwork": "GOOGLE_SEARCH",
+    }
+
+
+@mcp.tool()
+async def keyword_volumes(
+    keywords: List[str] = Field(description="Mots-clés à mesurer (100 au plus)"),
+    location: str = Field(default="France", description="'France', une ville ou un département par son nom (ex. 'Montpellier'), plusieurs séparés par des virgules, ou des ids geoTargetConstant"),
+    language: str = Field(default="fr", description="Langue : fr, en, es, de, it"),
+) -> str:
+    """
+    Volumes de recherche mensuels RÉELS Google (Keyword Planner) pour une liste de mots-clés :
+    moyenne sur 12 mois, concurrence, fourchette d'enchère haut de page, et les 12 derniers mois.
+    Gratuit (API Google Ads). À préférer à DataForSEO pour un volume Google Search en France.
+    """
+    try:
+        kws = [k.strip() for k in keywords if k and k.strip()]
+        if not kws:
+            return "Aucun mot-clé fourni."
+        if len(kws) > MAX_KEYWORDS:
+            return f"Trop de mots-clés ({len(kws)}) : {MAX_KEYWORDS} au plus par appel."
+        headers = get_headers(get_credentials())
+        body = {**_planner_common(headers, location, language), "keywords": kws}
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{KEYWORD_CUSTOMER_ID}:generateKeywordHistoricalMetrics"
+        r = requests.post(url, headers=headers, json=body)
+        if r.status_code != 200:
+            return f"Erreur Keyword Planner : {r.text[:800]}"
+        rows = r.json().get("results", [])
+        if not rows:
+            return "Aucune donnée pour ces mots-clés."
+        return f"Volumes Google ({location}, {language}) :\n" + _format_metrics_rows(rows, "keywordMetrics")
+    except Exception as e:
+        return f"Erreur Keyword Planner : {str(e)}"
+
+
+@mcp.tool()
+async def keyword_ideas(
+    seed_keywords: List[str] = Field(default=[], description="Mots-clés de départ (20 au plus)"),
+    page_url: str = Field(default="", description="Ou/et une page dont Google tire des idées (ex. https://webtrafic.fr/)"),
+    location: str = Field(default="France", description="'France', une ville ou un département par son nom, ou des ids geoTargetConstant"),
+    language: str = Field(default="fr", description="Langue : fr, en, es, de, it"),
+    limit: int = Field(default=50, description="Nombre d'idées rendues (200 au plus)"),
+) -> str:
+    """
+    Idées de mots-clés Google (Keyword Planner) à partir de mots de départ et/ou d'une page,
+    avec volume mensuel réel, concurrence et enchères. Triées par volume décroissant.
+    """
+    try:
+        seeds = [k.strip() for k in (seed_keywords or []) if k and k.strip()][:20]
+        if not seeds and not page_url:
+            return "Donne au moins un mot-clé de départ ou une page."
+        limit = max(1, min(int(limit or 50), 200))
+        headers = get_headers(get_credentials())
+        body = {**_planner_common(headers, location, language), "pageSize": limit, "includeAdultKeywords": False}
+        if seeds and page_url:
+            body["keywordAndUrlSeed"] = {"keywords": seeds, "url": page_url}
+        elif seeds:
+            body["keywordSeed"] = {"keywords": seeds}
+        else:
+            body["urlSeed"] = {"url": page_url}
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{KEYWORD_CUSTOMER_ID}:generateKeywordIdeas"
+        r = requests.post(url, headers=headers, json=body)
+        if r.status_code != 200:
+            return f"Erreur Keyword Planner : {r.text[:800]}"
+        rows = r.json().get("results", [])[:limit]
+        if not rows:
+            return "Aucune idée rendue."
+        rows.sort(key=lambda x: int((x.get("keywordIdeaMetrics") or {}).get("avgMonthlySearches", 0) or 0), reverse=True)
+        return f"Idées Google ({location}, {language}), {len(rows)} :\n" + _format_metrics_rows(rows, "keywordIdeaMetrics")
+    except Exception as e:
+        return f"Erreur Keyword Planner : {str(e)}"
+
 
 @mcp.resource("gaql://reference")
 def gaql_reference() -> str:
