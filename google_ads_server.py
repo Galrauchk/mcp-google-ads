@@ -45,7 +45,6 @@ except ImportError:
 
 # Get credentials from environment variables
 GOOGLE_ADS_CREDENTIALS_PATH = os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH")
-GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
 GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
 GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # oauth or service_account
 
@@ -202,10 +201,7 @@ def get_oauth_credentials():
     return creds
 
 def get_headers(creds):
-    """Get headers for Google Ads API requests."""
-    if not GOOGLE_ADS_DEVELOPER_TOKEN:
-        raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set")
-    
+    """OAuth determines Cloud project access; no developer token since 2026-09-09."""
     # Handle different credential types
     if isinstance(creds, service_account.Credentials):
         # For service account, we need to get a new bearer token
@@ -233,7 +229,6 @@ def get_headers(creds):
         
     headers = {
         'Authorization': f'Bearer {token}',
-        'developer-token': GOOGLE_ADS_DEVELOPER_TOKEN,
         'content-type': 'application/json'
     }
     

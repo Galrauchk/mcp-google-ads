@@ -201,17 +201,19 @@ Choose Service Account if:
 - You don't want/need user interaction for authentication
 - You need automatic token refreshing without user intervention
 
-#### Getting a Developer Token
+#### Google Cloud project API access (since September 9, 2026)
 
-1. Sign in to your Google Ads account at [https://ads.google.com](https://ads.google.com)
-2. Click on Tools & Settings (wrench icon) in the top navigation
-3. Under "Setup", click "API Center"
-4. If you haven't already, accept the Terms of Service
-5. Click "Apply for token" 
-6. Fill out the application form with details about how you plan to use the API
-7. Submit the application and wait for approval (usually 1-3 business days)
+Google Ads API access levels now belong to the Google Cloud project that owns your OAuth
+client or service account. Developer tokens have been sunset. This server sends OAuth
+credentials and the optional manager account ID; it does not require or transmit a developer token.
 
-Note: Initially, you'll get a test Developer Token that has some limitations. Once you've tested your implementation, you can apply for a production token that removes these restrictions.
+Check the existing project's access level in the [Google Ads API overview](https://console.cloud.google.com/apis/api/googleads.googleapis.com/overview).
+Request a suitable access level there only if an API call reports a project access restriction.
+Keep using the existing project and credentials when access already works.
+Do not apply for a token through the old Google Ads API Center.
+
+See the [official migration guide](https://developers.google.com/google-ads/api/docs/api-policy/developer-token).
+API project access and access to an advertiser's Google Ads account remain separate requirements.
 
 ### Understanding the Login Customer ID
 
@@ -363,8 +365,6 @@ The Google Ads MCP now supports environment file configuration for easier setup.
    # Path to your credentials file (OAuth client secret or service account key)
    GOOGLE_ADS_CREDENTIALS_PATH=/path/to/your/credentials.json
    
-   # Your Google Ads Developer Token
-   GOOGLE_ADS_DEVELOPER_TOKEN=your_developer_token_here
    
    # Optional: Manager Account ID (if applicable)
    GOOGLE_ADS_LOGIN_CUSTOMER_ID=your_manager_account_id
@@ -389,7 +389,6 @@ You can also set environment variables directly in your system or in the configu
       "env": {
         "GOOGLE_ADS_AUTH_TYPE": "oauth",
         "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/credentials.json",
-        "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
         "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
       }
     }
@@ -408,7 +407,6 @@ You can also set environment variables directly in your system or in the configu
       "env": {
         "GOOGLE_ADS_AUTH_TYPE": "oauth",
         "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/credentials.json",
-        "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
         "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
       }
     }
@@ -440,7 +438,6 @@ Add the following text (this tells Claude how to connect to Google Ads):
       "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
       "env": {
         "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
-        "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
         "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
       }
     }
@@ -453,7 +450,7 @@ Add the following text (this tells Claude how to connect to Google Ads):
 - The first path should point to the Python executable inside your virtual environment
 - The second path should point to the `google_ads_server.py` file inside the folder you unzipped
 - The third path should point to your Google service account credentials JSON file
-- Add your Google Ads Developer Token 
+- Verify the API access level of the Google Cloud project that owns your credentials
 - Add your Google Ads Manager Account ID (if applicable)
 
 Examples:
@@ -499,7 +496,6 @@ Cursor is an AI-powered code editor that can be enhanced with MCP tools. You can
          "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
          "env": {
            "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
-           "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
            "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
          }
        }
@@ -606,7 +602,7 @@ If you're having trouble connecting:
 
 1. Make sure all file paths in your configuration are correct and use the full path
 2. Check that your service account has access to your Google Ads accounts
-3. Verify that your Developer Token is valid and correctly entered
+3. Verify that the Google Cloud project that owns your credentials has suitable API access
 4. Restart Claude Desktop after making any changes
 5. Look for error messages in Claude's response when you try to use a tool
 6. Ensure your virtual environment is activated when running the server manually
@@ -616,7 +612,7 @@ If you're having trouble connecting:
 If you encounter issues related to API quotas or permissions:
 
 1. Check your Google Ads API quota limits in the Google Cloud Console
-2. Ensure your Developer Token has the appropriate access level
+2. Ensure your Google Cloud project has the appropriate API access level
 3. Verify that you've granted the proper permissions to your service account
 
 ### Other Unexpected Issues
